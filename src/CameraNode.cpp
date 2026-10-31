@@ -89,6 +89,17 @@ private:
   std::vector<std::thread> request_threads;
   std::unordered_map<const libcamera::Request *, std::mutex> request_mutexes;
   std::unordered_map<const libcamera::Request *, std::condition_variable> request_condvars;
+  // Completion flag per request, guarded by the request's mutex. Without it, a
+  // completion that arrives before process() is back in wait() is a lost
+  // wakeup: that thread sleeps forever and its buffer is never re-queued,
+  // until no buffers are left and the camera stops publishing.
+  std::unordered_map<const libcamera::Request *, bool> request_ready;
+  // Requests are processed on parallel threads and can finish out of order.
+  // Publishing is serialised and only frames newer than the last one published
+  // go out, so every subscriber sees monotonic stamps (H.264 decoders, such as
+  // Foxglove's, reject a frame that goes back in time).
+  std::mutex publish_mutex;
+  int64_t last_published_stamp_ns = 0;
   std::atomic<bool> running;
 
   struct buffer_info_t
@@ -606,6 +617,7 @@ CameraNode::CameraNode(const rclcpp::NodeOptions &options)
     // create mutexes in-place
     request_mutexes[request.get()];
     request_condvars[request.get()];
+    request_ready[request.get()] = false;
     request_threads.emplace_back(&CameraNode::process, this, request.get());
   }
 
@@ -711,7 +723,10 @@ CameraNode::onDisconnect()
 void
 CameraNode::requestComplete(libcamera::Request *const request)
 {
-  std::unique_lock lk(request_mutexes.at(request));
+  {
+    std::unique_lock lk(request_mutexes.at(request));
+    request_ready.at(request) = true;
+  }
   request_condvars.at(request).notify_one();
 }
 
@@ -719,12 +734,17 @@ void
 CameraNode::process(libcamera::Request *const request)
 {
   while (true) {
-    // block until request is available
+    // block until request is available (predicate: no lost or spurious wakeups)
     std::unique_lock lk(request_mutexes.at(request));
-    request_condvars.at(request).wait(lk);
+    request_condvars.at(request).wait(lk, [&] { return request_ready.at(request) || !running; });
 
     if (!running)
       return;
+
+    request_ready.at(request) = false;
+    // Don't hold the lock while processing: requestComplete() runs on
+    // libcamera's event thread and would block it behind this frame's work.
+    lk.unlock();
 
     // prepare message header
     std_msgs::msg::Header hdr;
@@ -820,12 +840,27 @@ CameraNode::process(libcamera::Request *const request)
                                  stream->configuration().pixelFormat.toString());
       }
 
-      pub_image->publish(std::move(msg_img));
-      pub_image_compressed->publish(std::move(msg_img_compressed));
+      {
+        // Publish in stamp order (see publish_mutex). The check and the
+        // publishes share one lock, or two threads could each pass the check
+        // and still publish in the wrong order.
+        std::lock_guard<std::mutex> publish_lk(publish_mutex);
+        const int64_t stamp_ns = rclcpp::Time(hdr.stamp).nanoseconds();
+        if (stamp_ns > last_published_stamp_ns) {
+          last_published_stamp_ns = stamp_ns;
 
-      sensor_msgs::msg::CameraInfo ci = cim.getCameraInfo();
-      ci.header = hdr;
-      pub_ci->publish(ci);
+          pub_image->publish(std::move(msg_img));
+          pub_image_compressed->publish(std::move(msg_img_compressed));
+
+          sensor_msgs::msg::CameraInfo ci = cim.getCameraInfo();
+          ci.header = hdr;
+          pub_ci->publish(ci);
+        }
+        else {
+          RCLCPP_DEBUG_STREAM(get_logger(), "dropped out-of-order frame ("
+                                              << (stamp_ns - last_published_stamp_ns) / 1000 << " us behind)");
+        }
+      }
     }
     else if (request->status() == libcamera::Request::RequestCancelled) {
       diagnostic_status.level = diagnostic_msgs::msg::DiagnosticStatus::WARN;
