@@ -3,6 +3,22 @@ project(camera_ros)
 
 set(CMAKE_CXX_STANDARD 20)
 
+# Raspberry Pi: prefer the RPi fork of libcamera installed in /usr/local (it
+# has the PiSP/VC4 pipeline handlers; distro and ROS libcamera builds do not).
+# Lives here rather than in build flags so a plain `colcon build` gets it,
+# e.g. when this package overlays an image's camera_ros from a workspace that
+# an entrypoint rebuilds on every start. Without these settings the build
+# links /opt/ros/<distro>'s libcamera (first on LD_LIBRARY_PATH at run time),
+# which has no RPi pipeline handler: "no cameras available".
+set(RPI_LIBCAMERA_LIBDIR /usr/local/lib/aarch64-linux-gnu)
+if(EXISTS ${RPI_LIBCAMERA_LIBDIR}/pkgconfig/libcamera.pc)
+  set(ENV{PKG_CONFIG_PATH} "${RPI_LIBCAMERA_LIBDIR}/pkgconfig:$ENV{PKG_CONFIG_PATH}")
+  set(CMAKE_INSTALL_RPATH ${RPI_LIBCAMERA_LIBDIR})
+  set(CMAKE_INSTALL_RPATH_USE_LINK_PATH ON)
+  # DT_RPATH, not DT_RUNPATH: only RPATH takes precedence over LD_LIBRARY_PATH.
+  add_link_options("-Wl,--disable-new-dtags")
+endif()
+
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wall -Wextra -Wpedantic -Werror)
   add_link_options("-Wl,-z,relro,-z,now,-z,defs")
