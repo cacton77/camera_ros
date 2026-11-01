@@ -7,6 +7,9 @@
 #include <cassert>
 #include <cctype>
 #include <cerrno>
+#include <chrono>
+#include <condition_variable>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #if __has_include(<cv_bridge/cv_bridge.hpp>)
@@ -16,6 +19,7 @@
 #endif
 #include <atomic>
 #include <diagnostic_msgs/msg/diagnostic_array.hpp>
+#include <future>
 #include <iostream>
 #include <libcamera/base/shared_fd.h>
 #include <libcamera/base/signal.h>
@@ -32,6 +36,7 @@
 #include <libcamera/request.h>
 #include <libcamera/stream.h>
 #include <memory>
+#include <mutex>
 #include <opencv2/core/mat.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <optional>
@@ -102,6 +107,31 @@ private:
   int64_t last_published_stamp_ns = 0;
   std::atomic<bool> running;
 
+  // Watchdog. libcamera can stop completing requests without reporting an
+  // error: every request stays queued, no frame arrives, the node goes quiet.
+  // Seen on a Pi 5 with an IMX477, both after hours of streaming and straight
+  // after start-up. When no frame has arrived for watchdog_timeout seconds the
+  // camera is stopped and started again in place; if that hangs, fails, or
+  // still yields no frames after watchdog_restarts attempts, the process exits
+  // with an error so that a supervisor (e.g. launch's respawn) can restart it.
+  double watchdog_timeout = 0;  // seconds, 0 disables the watchdog
+  int64_t watchdog_restarts = 3;
+  std::thread watchdog_thread;
+  std::mutex watchdog_mutex;
+  std::condition_variable watchdog_cv;
+  std::atomic<uint64_t> frame_count = 0;
+  std::atomic<int64_t> last_frame_ns = 0;  // steady clock
+  // Guards re-queueing against a restart: while 'restarting' is set, the
+  // processing threads park their request instead of queueing it, and the
+  // restart re-queues all of them once the camera has started again.
+  std::mutex queue_mutex;
+  std::condition_variable restart_cv;
+  bool restarting = false;
+  // Where each request is, guarded by queue_mutex: handed to libcamera and not
+  // returned yet, or parked during a restart. Otherwise a thread is processing it.
+  std::unordered_map<const libcamera::Request *, bool> request_in_camera;
+  std::unordered_map<const libcamera::Request *, bool> request_parked;
+
   struct buffer_info_t
   {
     void *data;
@@ -143,6 +173,15 @@ private:
   process(libcamera::Request *const request);
 
   void
+  watchdog();
+
+  bool
+  restartCamera();
+
+  void
+  publishWatchdogDiagnostic(uint8_t level, const std::string &message);
+
+  void
   postParameterChange(const std::vector<rclcpp::Parameter> &parameters);
 
 #ifndef RCLCPP_HAS_PARAM_EXT_CB
@@ -166,6 +205,14 @@ const rclcpp::PublisherOptionsWithAllocator<std::allocator<void>> CameraNode::pu
     rclcpp::QosPolicyKind::Reliability};
   return options;
 }();
+
+int64_t
+steady_ns()
+{
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+           std::chrono::steady_clock::now().time_since_epoch())
+    .count();
+}
 
 libcamera::StreamRole
 get_role(const std::string &role)
@@ -355,6 +402,23 @@ CameraNode::CameraNode(const rclcpp::NodeOptions &options)
   param_descr_use_node_time.description = "use node time instead of sensor timestamp for image messages";
   param_descr_use_node_time.read_only = true;
   use_node_time = declare_parameter<bool>("use_node_time", false, param_descr_use_node_time);
+
+  // watchdog
+  rcl_interfaces::msg::ParameterDescriptor param_descr_watchdog_timeout;
+  param_descr_watchdog_timeout.description =
+    "restart the camera when no frame has arrived for this many seconds (0 disables the watchdog)";
+  param_descr_watchdog_timeout.read_only = true;
+  watchdog_timeout = declare_parameter<double>("watchdog_timeout", 0.0, param_descr_watchdog_timeout);
+  if (watchdog_timeout < 0)
+    throw std::runtime_error("watchdog_timeout must not be negative");
+
+  rcl_interfaces::msg::ParameterDescriptor param_descr_watchdog_restarts;
+  param_descr_watchdog_restarts.description =
+    "in-place camera restarts the watchdog tries before exiting the process with an error";
+  param_descr_watchdog_restarts.read_only = true;
+  watchdog_restarts = declare_parameter<int64_t>("watchdog_restarts", 3, param_descr_watchdog_restarts);
+  if (watchdog_restarts < 0)
+    throw std::runtime_error("watchdog_restarts must not be negative");
 
   // publisher for raw and compressed image
   pub_image = this->create_publisher<sensor_msgs::msg::Image>("~/image_raw", 1, pubopts);
@@ -618,6 +682,8 @@ CameraNode::CameraNode(const rclcpp::NodeOptions &options)
     request_mutexes[request.get()];
     request_condvars[request.get()];
     request_ready[request.get()] = false;
+    request_in_camera[request.get()] = false;
+    request_parked[request.get()] = false;
     request_threads.emplace_back(&CameraNode::process, this, request.get());
   }
 
@@ -640,10 +706,24 @@ CameraNode::CameraNode(const rclcpp::NodeOptions &options)
   cameras_in_use++;
 
   // queue all requests
-  for (std::unique_ptr<libcamera::Request> &request : requests) {
-    if (const int ret = camera->queueRequest(request.get()); ret < 0) {
-      RCLCPP_WARN_STREAM(get_logger(), "failed to queue request (" << request->toString() << "): " << strerror(-ret));
+  {
+    std::lock_guard queue_lk(queue_mutex);
+    for (std::unique_ptr<libcamera::Request> &request : requests) {
+      if (const int ret = camera->queueRequest(request.get()); ret < 0) {
+        RCLCPP_WARN_STREAM(get_logger(), "failed to queue request (" << request->toString() << "): " << strerror(-ret));
+      }
+      else {
+        request_in_camera.at(request.get()) = true;
+      }
     }
+  }
+
+  if (watchdog_timeout > 0) {
+    last_frame_ns = steady_ns();
+    watchdog_thread = std::thread(&CameraNode::watchdog, this);
+    RCLCPP_INFO_STREAM(get_logger(), "watchdog enabled: restart after " << watchdog_timeout
+                                                                       << " s without a frame, up to "
+                                                                       << watchdog_restarts << " times");
   }
 }
 
@@ -660,6 +740,19 @@ CameraNode::~CameraNode()
   // unlock all threads
   for (auto &[req, condvar] : request_condvars)
     condvar.notify_all();
+
+  // stop the watchdog, and any restart it is waiting on (taking each mutex
+  // before notifying, so a thread between its check and its wait can't miss it)
+  {
+    std::lock_guard lk(queue_mutex);
+  }
+  restart_cv.notify_all();
+  {
+    std::lock_guard lk(watchdog_mutex);
+  }
+  watchdog_cv.notify_all();
+  if (watchdog_thread.joinable())
+    watchdog_thread.join();
 
   // wait for all currently running threads to finish
   for (std::thread &thread : request_threads)
@@ -724,6 +817,10 @@ void
 CameraNode::requestComplete(libcamera::Request *const request)
 {
   {
+    std::lock_guard queue_lk(queue_mutex);
+    request_in_camera.at(request) = false;
+  }
+  {
     std::unique_lock lk(request_mutexes.at(request));
     request_ready.at(request) = true;
   }
@@ -775,6 +872,9 @@ CameraNode::process(libcamera::Request *const request)
       assert(request->buffers().size() == 1);
 
       diagnostic_status.level = diagnostic_msgs::msg::DiagnosticStatus::OK;
+
+      last_frame_ns = steady_ns();
+      frame_count++;
 
       // publish metadata, sorted by control ID
       for (const auto &[id, value] : std::map {
@@ -864,7 +964,15 @@ CameraNode::process(libcamera::Request *const request)
     }
     else if (request->status() == libcamera::Request::RequestCancelled) {
       diagnostic_status.level = diagnostic_msgs::msg::DiagnosticStatus::WARN;
-      RCLCPP_ERROR_STREAM(get_logger(), "request '" << request->toString() << "' cancelled");
+      bool expected;
+      {
+        std::lock_guard queue_lk(queue_mutex);
+        expected = restarting;  // the watchdog's camera->stop() cancels every queued request
+      }
+      if (expected)
+        RCLCPP_DEBUG_STREAM(get_logger(), "request '" << request->toString() << "' cancelled by restart");
+      else
+        RCLCPP_ERROR_STREAM(get_logger(), "request '" << request->toString() << "' cancelled");
     }
 
     diagnostic_array.status.push_back(diagnostic_status);
@@ -883,11 +991,24 @@ CameraNode::process(libcamera::Request *const request)
       RCLCPP_DEBUG_STREAM(get_logger(), "applied control '" << name << "': " << (value.isNone() ? "NONE" : value.toString()));
     }
 
-    if (const int ret = camera->queueRequest(request); ret < 0) {
-      RCLCPP_WARN_STREAM(get_logger(), "failed to queue request (" << request->toString() << "): " << strerror(-ret));
-      if (ret == -ENODEV || ret == -EACCES) {
-        running = false;
-        return;
+    {
+      std::lock_guard queue_lk(queue_mutex);
+      if (restarting) {
+        // The camera is being restarted and cannot take requests; hand this
+        // one to restartCamera(), which queues it once the camera is running.
+        request_parked.at(request) = true;
+        restart_cv.notify_all();
+        continue;
+      }
+      if (const int ret = camera->queueRequest(request); ret < 0) {
+        RCLCPP_WARN_STREAM(get_logger(), "failed to queue request (" << request->toString() << "): " << strerror(-ret));
+        if (ret == -ENODEV || ret == -EACCES) {
+          running = false;
+          return;
+        }
+      }
+      else {
+        request_in_camera.at(request) = true;
       }
     }
 
@@ -895,6 +1016,169 @@ CameraNode::process(libcamera::Request *const request)
       RCLCPP_WARN_STREAM(get_logger(), "Failed to synchronise control values of queued request!");
     }
   }
+}
+
+void
+CameraNode::publishWatchdogDiagnostic(const uint8_t level, const std::string &message)
+{
+  diagnostic_msgs::msg::DiagnosticArray diagnostic_array;
+  diagnostic_array.header.stamp = this->now();
+  diagnostic_array.header.frame_id = frame_id;
+
+  diagnostic_msgs::msg::DiagnosticStatus diagnostic_status;
+  diagnostic_status.hardware_id = camera->id();
+  diagnostic_status.level = level;
+  diagnostic_status.message = message;
+
+  diagnostic_array.status.push_back(diagnostic_status);
+  pub_diagnostics->publish(diagnostic_array);
+}
+
+void
+CameraNode::watchdog()
+{
+  using namespace std::chrono;
+  const auto timeout = duration_cast<nanoseconds>(duration<double>(watchdog_timeout));
+  // check a few times per timeout, so a stall is caught within ~1.25 timeouts
+  const auto period = timeout / 4;
+  // a restart that takes longer than this is treated as hung
+  const auto restart_deadline = std::max<nanoseconds>(seconds(10), 2 * timeout);
+
+  int64_t attempts = 0;
+  uint64_t frames_at_restart = frame_count;
+  int64_t restarted_ns = 0;
+
+  // Leave the process without running destructors: they would stop the
+  // camera, which is what just hung or failed.
+  const auto give_up = [this](const std::string &why) {
+    RCLCPP_FATAL_STREAM(get_logger(), "watchdog: " << why << ", exiting so the node can be restarted");
+    publishWatchdogDiagnostic(diagnostic_msgs::msg::DiagnosticStatus::ERROR, "watchdog: " + why);
+    std::cout << std::flush;
+    std::cerr << std::flush;
+    std::_Exit(EXIT_FAILURE);
+  };
+
+  std::unique_lock lk(watchdog_mutex);
+  while (running) {
+    watchdog_cv.wait_for(lk, period, [this] { return !running; });
+    if (!running)
+      return;
+
+    if (attempts > 0 && frame_count != frames_at_restart) {
+      RCLCPP_INFO_STREAM(get_logger(), "watchdog: frames resumed after restart");
+      publishWatchdogDiagnostic(diagnostic_msgs::msg::DiagnosticStatus::OK, "watchdog: frames resumed after restart");
+      attempts = 0;
+    }
+
+    const int64_t silent_ns = steady_ns() - std::max<int64_t>(last_frame_ns, restarted_ns);
+    if (silent_ns < timeout.count())
+      continue;
+
+    const std::string silence = "no frame for " + std::to_string(silent_ns / 1000000) + " ms";
+    if (attempts >= watchdog_restarts)
+      give_up(silence + " after " + std::to_string(attempts) + " restart(s)");
+
+    attempts++;
+    RCLCPP_WARN_STREAM(get_logger(), "watchdog: " << silence << ", restarting camera (attempt "
+                                                  << attempts << "/" << watchdog_restarts << ")");
+    publishWatchdogDiagnostic(diagnostic_msgs::msg::DiagnosticStatus::WARN,
+                              "watchdog: " + silence + ", restarting camera");
+
+    // Run the restart on its own thread: if libcamera is wedged, stop() may
+    // never return, and then the only way out is to exit the process.
+    auto result = std::make_shared<std::promise<bool>>();
+    std::future<bool> done = result->get_future();
+    lk.unlock();
+    std::thread([this, result] { result->set_value(restartCamera()); }).detach();
+    const bool finished = done.wait_for(restart_deadline) == std::future_status::ready;
+    lk.lock();
+
+    if (!finished)
+      give_up("camera restart hung");
+    if (!running)
+      return;  // node is shutting down
+    if (!done.get())
+      give_up("camera restart failed");
+
+    frames_at_restart = frame_count;
+    restarted_ns = steady_ns();
+  }
+}
+
+bool
+CameraNode::restartCamera()
+{
+  {
+    std::lock_guard lk(queue_mutex);
+    restarting = true;
+    for (auto &[request, parked] : request_parked)
+      parked = false;
+  }
+
+  // stop() cancels every request libcamera still holds and delivers those
+  // completions before it returns; each processing thread then parks its
+  // request instead of re-queueing it
+  if (const int ret = camera->stop(); ret < 0) {
+    RCLCPP_ERROR_STREAM(get_logger(), "watchdog: failed to stop camera: " << strerror(-ret));
+    return false;
+  }
+
+  {
+    std::unique_lock lk(queue_mutex);
+    // A request still marked as in the camera now was never returned: libcamera
+    // lost it, which is one way the camera can go silent. Wait for the others.
+    const auto settled = [this] {
+      return std::all_of(requests.cbegin(), requests.cend(), [this](const auto &request) {
+        return request_parked.at(request.get()) || request_in_camera.at(request.get());
+      });
+    };
+    const bool all_settled = restart_cv.wait_for(lk, std::chrono::seconds(5), [&] {
+      return settled() || !running;
+    });
+    if (!running)
+      return false;
+    if (!all_settled) {
+      const size_t busy = std::count_if(requests.cbegin(), requests.cend(), [this](const auto &request) {
+        return !request_parked.at(request.get()) && !request_in_camera.at(request.get());
+      });
+      RCLCPP_ERROR_STREAM(get_logger(), "watchdog: " << busy << " of " << requests.size()
+                                                     << " requests still being processed 5 s after stopping the camera");
+      return false;
+    }
+
+    // reclaim requests libcamera never returned; their threads are idle,
+    // waiting for a completion, and will process them once re-queued
+    size_t lost = 0;
+    for (const std::unique_ptr<libcamera::Request> &request : requests) {
+      if (request_in_camera.at(request.get())) {
+        request_in_camera.at(request.get()) = false;
+        request->reuse(libcamera::Request::ReuseBuffers);
+        lost++;
+      }
+    }
+    if (lost) {
+      RCLCPP_WARN_STREAM(get_logger(), "watchdog: libcamera never returned " << lost << " of " << requests.size()
+                                                                           << " requests, reclaiming them");
+    }
+  }
+
+  if (const int ret = camera->start(&parameter_handler.get_control_values()); ret < 0) {
+    RCLCPP_ERROR_STREAM(get_logger(), "watchdog: failed to start camera: " << strerror(-ret));
+    return false;
+  }
+
+  std::lock_guard lk(queue_mutex);
+  restarting = false;
+  for (const std::unique_ptr<libcamera::Request> &request : requests) {
+    request_parked.at(request.get()) = false;
+    if (const int ret = camera->queueRequest(request.get()); ret < 0) {
+      RCLCPP_ERROR_STREAM(get_logger(), "watchdog: failed to queue request (" << request->toString() << "): " << strerror(-ret));
+      return false;
+    }
+    request_in_camera.at(request.get()) = true;
+  }
+  RCLCPP_INFO_STREAM(get_logger(), "watchdog: camera restarted, " << requests.size() << " requests queued");
+  return true;
 }
 
 void

@@ -128,6 +128,8 @@ The camera stream is configured once when the node starts via the following stat
 | `camera_info_url` | `string`              | URL for a camera calibration YAML file (see [Calibration](#calibration)) [default: `~/.ros/camera_info/$NAME.yaml`]         |
 | `frame_id`        | `string`              | frame_id of the camera frame used in the header of the image messages                                                       |
 | `use_node_time`   | `boolean`             | use node time instead of sensor timestamp for image message header [default: `false`]                                       |
+| `watchdog_timeout`  | `double`            | restart the camera when no frame has arrived for this many seconds, `0` disables (see [Watchdog](#watchdog)) [default: `0`] |
+| `watchdog_restarts` | `integer`           | in-place camera restarts to try before the node exits with an error [default: `3`]                                          |
 
 
 The configuration is done in the following order:
@@ -142,6 +144,12 @@ Each stream role only supports a discrete set of data stream configurations as a
 By default, the node will select the first available camera and configures it with the default pixel format and image resolution. If a parameter has not been set, the node will print the available options and inform the user about the default choice.
 
 The node avoids memory copies of the image data by directly mapping from a camera pixel format to a ROS image format, with the exception of converting between "raw" and "compressed" image formats when requested by the user. As an effect, not all pixel formats that are supported by the camera may be supported by the ROS image message. Hence, the options for `format` are limited to pixel formats that are supported by the camera and the raw ROS image message.
+
+### Watchdog
+
+libcamera can stop completing requests without reporting any error: the camera stays started, every buffer stays queued, and the node simply stops publishing. Setting `watchdog_timeout` makes the node detect this. When no frame has arrived for that many seconds, it stops and restarts the camera in place, keeping the stream configuration, buffers and publishers. If the restart hangs or fails, or the camera still delivers nothing after `watchdog_restarts` restarts, the node exits with a non-zero code instead of staying silent, so run it under a supervisor that restarts it, e.g. with `respawn=True` in a launch file. Each restart and exit is logged and reported on `/diagnostics`.
+
+Pick a timeout well above the frame interval and the camera's start-up time, e.g. `5.0` seconds. Exiting takes the whole process down, so with a component container it also stops the other components in it.
 
 ### Sensor Modes and Cropping
 
